@@ -10,6 +10,7 @@ import { FixedBottomCTA } from "@/src/features/tacuen/ui/components/FixedBottomC
 import { AllocationEditor } from "@/src/features/tacuen/ui/components/AllocationEditor";
 import { ItemCard } from "@/src/features/tacuen/ui/components/ItemCard";
 import type { ReceiptItem, Allocation } from "@/src/features/tacuen/model/types";
+import { formatCents } from "@/src/features/tacuen/model/money";
 
 export default function SplitPage() {
   const router = useRouter();
@@ -118,7 +119,7 @@ export default function SplitPage() {
                       {item.name}
                     </div>
                     <div className="text-xs text-neutral-400 mt-1">
-                      {item.qty} x {item.unitPrice.toFixed(2)} = {item.total.toFixed(2)}
+                      {item.qty} x {formatCents(item.unitPriceCents, state.model.currency)} = {formatCents(item.totalCents, state.model.currency)}
                     </div>
                   </div>
                   <div className="ml-3">

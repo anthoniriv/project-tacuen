@@ -2,6 +2,7 @@
 
 import ExcelJS from "exceljs";
 import type { ReceiptModel, CalculationSummary, AllocationMode } from "./types";
+import { fromCents } from "./money";
 
 /**
  * Genera un Excel con 3 hojas según la especificación:
@@ -49,8 +50,8 @@ export async function generateReceiptExcel(
     itemsSheet.addRow({
       name: item.name,
       qty: item.qty,
-      unitPrice: item.unitPrice,
-      total: item.total,
+      unitPrice: fromCents(item.unitPriceCents),
+      total: fromCents(item.totalCents),
       allocationMode: mode,
       participants,
     });
@@ -75,26 +76,26 @@ export async function generateReceiptExcel(
   for (const personTotal of summary.personTotals) {
     personasSheet.addRow({
       person: personTotal.personName,
-      itemsSubtotal: personTotal.itemsSubtotal,
-      delivery: personTotal.fees.delivery,
-      tip: personTotal.fees.tip,
-      service: personTotal.fees.service,
-      tax: personTotal.fees.tax,
-      discount: personTotal.discount,
-      total: personTotal.total,
+      itemsSubtotal: fromCents(personTotal.itemsSubtotalCents),
+      delivery: personTotal.feesCents ? fromCents(personTotal.feesCents.delivery) : 0,
+      tip: personTotal.feesCents ? fromCents(personTotal.feesCents.tip) : 0,
+      service: personTotal.feesCents ? fromCents(personTotal.feesCents.service) : 0,
+      tax: personTotal.feesCents ? fromCents(personTotal.feesCents.tax) : 0,
+      discount: fromCents(personTotal.discountCents),
+      total: fromCents(personTotal.totalCents),
     });
   }
 
   // Fila total
   const totalRow = personasSheet.addRow({
     person: "TOTAL",
-    itemsSubtotal: summary.totals.itemsSubtotal,
-    delivery: summary.totals.fees.delivery,
-    tip: summary.totals.fees.tip,
-    service: summary.totals.fees.service,
-    tax: summary.totals.fees.tax,
-    discount: summary.totals.discount,
-    total: summary.totals.total,
+    itemsSubtotal: fromCents(summary.totals.itemsSubtotalCents),
+    delivery: summary.totals.feesCents ? fromCents(summary.totals.feesCents.delivery) : 0,
+    tip: summary.totals.feesCents ? fromCents(summary.totals.feesCents.tip) : 0,
+    service: summary.totals.feesCents ? fromCents(summary.totals.feesCents.service) : 0,
+    tax: summary.totals.feesCents ? fromCents(summary.totals.feesCents.tax) : 0,
+    discount: fromCents(summary.totals.discountCents),
+    total: fromCents(summary.totals.totalCents),
   });
   totalRow.font = { bold: true };
   totalRow.fill = {
@@ -114,30 +115,32 @@ export async function generateReceiptExcel(
 
   // Totales
   summarySheet.addRow(["TOTALES", ""]);
-  summarySheet.addRow(["Subtotal (Items)", summary.totals.itemsSubtotal]);
-  summarySheet.addRow(["Delivery", summary.totals.fees.delivery]);
-  summarySheet.addRow(["Tip", summary.totals.fees.tip]);
-  summarySheet.addRow(["Service", summary.totals.fees.service]);
-  summarySheet.addRow(["Tax (IGV)", summary.totals.fees.tax]);
-  summarySheet.addRow(["Descuento", -summary.totals.discount]); // Negativo porque es descuento
-  summarySheet.addRow(["Subtotal (Items + Fees)", summary.totals.subtotal]);
-  summarySheet.addRow(["Total Final", summary.totals.total]);
-  summarySheet.addRow(["Total Original", summary.totals.originalTotal]);
+  summarySheet.addRow(["Subtotal (Items)", fromCents(summary.totals.itemsSubtotalCents)]);
+  if (summary.totals.feesCents) {
+    summarySheet.addRow(["Delivery", fromCents(summary.totals.feesCents.delivery)]);
+    summarySheet.addRow(["Tip", fromCents(summary.totals.feesCents.tip)]);
+    summarySheet.addRow(["Service", fromCents(summary.totals.feesCents.service)]);
+    summarySheet.addRow(["Tax (IGV)", fromCents(summary.totals.feesCents.tax)]);
+  }
+  summarySheet.addRow(["Descuento", -fromCents(summary.totals.discountCents)]); // Negativo porque es descuento
+  summarySheet.addRow(["Subtotal (Items + Fees)", fromCents(summary.totals.subtotalCents)]);
+  summarySheet.addRow(["Total Final", fromCents(summary.totals.totalCents)]);
+  summarySheet.addRow(["Total Original", fromCents(summary.totals.totalDetectedCents)]);
   summarySheet.addRow([]);
 
   // Rounding
   summarySheet.addRow(["ROUNDING", ""]);
   summarySheet.addRow(["Estrategia", formatRoundingStrategy(summary.totals.rounding.strategy)]);
   summarySheet.addRow(["Step", summary.totals.rounding.step]);
-  summarySheet.addRow(["Aplicado", summary.totals.rounding.applied]);
-  summarySheet.addRow(["Diferencia", summary.totals.difference]);
+  summarySheet.addRow(["Aplicado", fromCents(summary.totals.rounding.appliedCents)]);
+  summarySheet.addRow(["Diferencia", fromCents(summary.totals.differenceCents)]);
   summarySheet.addRow([]);
 
   // Resumen por persona (compacto)
   summarySheet.addRow(["RESUMEN POR PERSONA", ""]);
   summarySheet.addRow(["Persona", "Total"]);
   for (const personTotal of summary.personTotals) {
-    summarySheet.addRow([personTotal.personName, personTotal.total]);
+    summarySheet.addRow([personTotal.personName, fromCents(personTotal.totalCents)]);
   }
 
   // Estilos para Summary

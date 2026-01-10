@@ -9,6 +9,7 @@ import { StepHeader } from "@/src/features/tacuen/ui/components/StepHeader";
 import { FixedBottomCTA } from "@/src/features/tacuen/ui/components/FixedBottomCTA";
 import { SummaryCard } from "@/src/features/tacuen/ui/components/SummaryCard";
 import { generateReceiptExcel } from "@/src/features/tacuen/model/excel";
+import { formatCents } from "@/src/features/tacuen/model/money";
 
 export default function SummaryPage() {
   const router = useRouter();
@@ -76,19 +77,13 @@ export default function SummaryPage() {
 
     // Generar mensajes individuales para cada persona
     const messages = state.summary.personTotals.map((personTotal) => {
-      const formatCurrency = (amount: number) => {
-        return new Intl.NumberFormat("es-PE", {
-          style: "currency",
-          currency: state.model!.currency || "PEN",
-          minimumFractionDigits: 2,
-        }).format(amount);
-      };
+      const currency = state.model!.currency || "PEN";
 
       const detail = personTotal.itemsBreakdown
-        .map((item) => `  - ${item.itemName} (x${item.qty.toFixed(1)}): ${formatCurrency(item.total)}`)
+        .map((item) => `  - ${item.itemName} (x${item.qty.toFixed(1)}): ${formatCents(item.totalCents, currency)}`)
         .join("\n");
 
-      const message = `Hola ${personTotal.personName}! Tu parte de la cuenta "${state.model!.name}" es ${formatCurrency(personTotal.total)}.\n\n${detail ? `Detalle:\n${detail}` : ""}\n\nGracias!`;
+      const message = `Hola ${personTotal.personName}! Tu parte de la cuenta "${state.model!.name}" es ${formatCents(personTotal.totalCents, currency)}.\n\n${detail ? `Detalle:\n${detail}` : ""}\n\nGracias!`;
 
       return {
         person: personTotal.personName,
@@ -191,13 +186,10 @@ export default function SummaryPage() {
             ? "Organizador absorbe diferencia"
             : "Dividir diferencia entre todos"}
         </p>
-        {Math.abs(state.summary.totals.difference) > 0.01 && (
+        {Math.abs(state.summary.totals.differenceCents) > 1 && (
           <p className="text-xs mt-2 text-blue-300">
             ⚠ Diferencia detectada:{" "}
-            {new Intl.NumberFormat("es-PE", {
-              style: "currency",
-              currency: state.model.currency || "PEN",
-            }).format(state.summary.totals.difference)}
+            {formatCents(state.summary.totals.differenceCents, state.model.currency)}
           </p>
         )}
       </div>
