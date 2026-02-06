@@ -1,5 +1,6 @@
 // lib/ia/analizarTicket.ts
 import { openai } from "./openaiClient";
+import sharp from "sharp";
 import type { AnalisisTicketIA, LineaItem } from "@/lib/excel/generarExcel";
 
 /**
@@ -21,6 +22,35 @@ async function fileToBase64(file: File): Promise<string> {
   const arrayBuffer = await file.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
   return buffer.toString("base64");
+}
+
+/** Convierte un File a base64 aplicando mejoras de imagen (contrast, grayscale, sharpen) */
+async function fileToBase64Enhanced(file: File, mode: "mild" | "strong" = "mild"): Promise<string> {
+  const arrayBuffer = await file.arrayBuffer();
+  const input = Buffer.from(arrayBuffer);
+
+  let pipeline = sharp(input).rotate().grayscale();
+
+  if (mode === "mild") {
+    pipeline = pipeline
+      .resize({ width: 1600, withoutEnlargement: false })
+      .normalize()
+      .sharpen(1.2)
+      .linear(1.05, -5)
+      .gamma(1.1);
+  } else {
+    pipeline = pipeline
+      .resize({ width: 2000, withoutEnlargement: false })
+      .median(1)
+      .normalize()
+      .sharpen(2)
+      .linear(1.25, -12)
+      .gamma(1.2);
+  }
+
+  const enhanced = await pipeline.toBuffer();
+
+  return enhanced.toString("base64");
 }
 
 function round2(n: number): number {
@@ -49,6 +79,145 @@ function keyName(s: string): string {
 /** Key tolerante para precio (redondeo 2) */
 function keyPrice(n: number): string {
   return round2(n).toFixed(2);
+}
+
+function sumItemsTotal(items: LineaItem[]): number {
+  return round2(items.reduce((acc, it) => acc + (Number(it.total) || 0), 0));
+}
+
+function normalizeItemName(s: string): string {
+  return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function findRawMatch(llmItem: LineaItem, rawItems: LineaItem[]): LineaItem | null {
+  const target = normalizeItemName(llmItem.nombre);
+  if (!target) return null;
+  for (const raw of rawItems) {
+    const rawName = normalizeItemName(raw.nombre);
+    if (!rawName) continue;
+    if (rawName.includes(target) || target.includes(rawName)) {
+      return raw;
+    }
+  }
+  return null;
+}
+
+function adjustItemsTotalsToTarget(
+  llmItems: LineaItem[],
+  rawItems: LineaItem[],
+  targetTotal?: number
+): LineaItem[] {
+  if (!Number.isFinite(targetTotal) || (targetTotal ?? 0) <= 0) return llmItems;
+  if (rawItems.length === 0) return llmItems;
+
+  let current = sumItemsTotal(llmItems);
+  let currentDiff = Math.abs((targetTotal as number) - current);
+
+  const candidates: Array<{
+    idx: number;
+    newTotal: number;
+    improvement: number;
+  }> = [];
+
+  llmItems.forEach((item, idx) => {
+    const raw = findRawMatch(item, rawItems);
+    if (!raw) return;
+    const newTotal = Number(raw.total) || 0;
+    if (newTotal <= 0) return;
+    const newSum = current - Number(item.total || 0) + newTotal;
+    const newDiff = Math.abs((targetTotal as number) - newSum);
+    const improvement = currentDiff - newDiff;
+    if (improvement > 0.001) {
+      candidates.push({ idx, newTotal, improvement });
+    }
+  });
+
+  // Greedy: aplicar las mejores mejoras primero
+  candidates.sort((a, b) => b.improvement - a.improvement);
+
+  const adjusted = llmItems.map((it) => ({ ...it }));
+  for (const c of candidates) {
+    const item = adjusted[c.idx];
+    const newSum = current - Number(item.total || 0) + c.newTotal;
+    const newDiff = Math.abs((targetTotal as number) - newSum);
+    if (newDiff < currentDiff) {
+      item.total = c.newTotal;
+      item.precioUnitario = item.cantidad > 0 ? round2(c.newTotal / item.cantidad) : item.precioUnitario;
+      current = newSum;
+      currentDiff = newDiff;
+    }
+  }
+
+  return adjusted;
+}
+
+function pickBestItemsByTotal(
+  itemsFromLines: LineaItem[],
+  itemsFromLLM: LineaItem[],
+  importeTotal?: number
+): LineaItem[] {
+  if (!Number.isFinite(importeTotal) || (importeTotal ?? 0) <= 0) {
+    return itemsFromLines.length >= 5 ? itemsFromLines : itemsFromLLM;
+  }
+  const target = Number(importeTotal);
+  const sumLines = sumItemsTotal(itemsFromLines);
+  const sumLLM = sumItemsTotal(itemsFromLLM);
+  const diffLines = Math.abs(target - sumLines);
+  const diffLLM = Math.abs(target - sumLLM);
+  return diffLines <= diffLLM ? itemsFromLines : itemsFromLLM;
+}
+
+type CandidatePick = {
+  raw_lines: string[];
+  analysis: AnalisisTicketIA;
+  items: LineaItem[];
+  diffToTotal: number;
+  itemCount: number;
+};
+
+function buildCandidate(raw_lines: string[], analysis: AnalisisTicketIA): CandidatePick {
+  const itemsFromLines = parsearItemsDesdeLineas(raw_lines);
+  const llmItems = ((analysis as any).items ?? []) as LineaItem[];
+  let items = llmItems;
+  if (itemsFromLines.length >= 5) {
+    const best = pickBestItemsByTotal(itemsFromLines, llmItems, (analysis as any).importeTotal);
+    items = adjustItemsTotalsToTarget(best, itemsFromLines, (analysis as any).importeTotal);
+  }
+  const total = Number((analysis as any).importeTotal ?? 0);
+  const sum = sumItemsTotal(items);
+  const diffToTotal = Number.isFinite(total) && total > 0 ? Math.abs(total - sum) : 9999;
+  return { raw_lines, analysis, items, diffToTotal, itemCount: items.length };
+}
+
+function pickBestCandidate(candidates: CandidatePick[]): CandidatePick {
+  return candidates.sort((a, b) => {
+    if (a.diffToTotal !== b.diffToTotal) return a.diffToTotal - b.diffToTotal;
+    return b.itemCount - a.itemCount;
+  })[0];
+}
+
+function addOcrAdjustmentItem(
+  items: LineaItem[],
+  importeTotal?: number
+): LineaItem[] {
+  if (!Number.isFinite(importeTotal) || (importeTotal ?? 0) <= 0) return items;
+  const sum = sumItemsTotal(items);
+  const diff = round2((importeTotal as number) - sum);
+  if (Math.abs(diff) < 0.01) return items;
+  // Solo ajustar si es un desvío razonable
+  if (Math.abs(diff) > 50) return items;
+
+  return [
+    ...items,
+    {
+      nombre: "AJUSTE OCR (revisar)",
+      cantidad: 1,
+      total: diff,
+      precioUnitario: diff,
+      categoria: "otro",
+      esBonificacion: false,
+    },
+  ];
 }
 
 type Categoria = "plato" | "bebida" | "postre" | "otro";
@@ -322,8 +491,11 @@ const TRANSCRIBIR_SCHEMA = {
   },
 } as const;
 
-export async function transcribirTicketALineas(file: File): Promise<string[]> {
-  const base64 = await fileToBase64(file);
+export async function transcribirTicketALineas(
+  file: File,
+  opts?: { enhanced?: "mild" | "strong" }
+): Promise<string[]> {
+  const base64 = opts?.enhanced ? await fileToBase64Enhanced(file, opts.enhanced) : await fileToBase64(file);
   const mimeType = file.type || "image/jpeg";
   const dataUrl = `data:${mimeType};base64,${base64}`;
 
@@ -537,22 +709,39 @@ export async function analizarTicketConIA_v2(
   file: File,
   contexto?: string
 ): Promise<{ parsed: AnalisisTicketIA; raw_lines: string[] }> {
-  // A) transcribir
-  const raw_lines = await transcribirTicketALineas(file);
+  // A) transcribir (paso normal)
+  const rawNormal = await transcribirTicketALineas(file);
+  const analysisNormal = await parsearLineasATicketConIA(rawNormal, contexto);
+  const candNormal = buildCandidate(rawNormal, analysisNormal);
 
-  // B) IA: construir AnalisisTicketIA completo
-  let analysis = await parsearLineasATicketConIA(raw_lines, contexto);
-
-  // C) Patch determinístico de items (Chili's)
-  const itemsFromLines = parsearItemsDesdeLineas(raw_lines);
-  if (itemsFromLines.length >= 5) {
-    analysis = { ...analysis, items: itemsFromLines };
+  // B) Si está débil, probar imagen mejorada (mild)
+  let candidates: CandidatePick[] = [candNormal];
+  if (candNormal.diffToTotal > 5 || candNormal.itemCount < 5) {
+    const rawMild = await transcribirTicketALineas(file, { enhanced: "mild" });
+    if (rawMild.length > 0) {
+      const analysisMild = await parsearLineasATicketConIA(rawMild, contexto);
+      candidates.push(buildCandidate(rawMild, analysisMild));
+    }
   }
 
-  // D) validar
-  const v = validarBasico(analysis);
+  // C) Si sigue débil, probar imagen mejorada (strong)
+  const bestSoFar = pickBestCandidate(candidates);
+  if (bestSoFar.diffToTotal > 5 || bestSoFar.itemCount < 5) {
+    const rawStrong = await transcribirTicketALineas(file, { enhanced: "strong" });
+    if (rawStrong.length > 0) {
+      const analysisStrong = await parsearLineasATicketConIA(rawStrong, contexto);
+      candidates.push(buildCandidate(rawStrong, analysisStrong));
+    }
+  }
 
-  // E) retry 1 vez
+  const best = pickBestCandidate(candidates);
+  let raw_lines = best.raw_lines;
+  let analysis: AnalisisTicketIA = { ...best.analysis, items: best.items };
+
+  // D) validar
+  let v = validarBasico(analysis);
+
+  // F) retry 1 vez si aún no cuadra
   if (!v.ok) {
     const res = await openai.chat.completions.create({
       model: "gpt-4o",
@@ -575,11 +764,25 @@ export async function analizarTicketConIA_v2(
 
       // reaplicar patch items
       const patchedItems = parsearItemsDesdeLineas(raw_lines);
+      const llmItems = ((compatible as any).items ?? []) as LineaItem[];
+      const best = patchedItems.length >= 5
+        ? pickBestItemsByTotal(patchedItems, llmItems, (compatible as any).importeTotal)
+        : llmItems;
+      const adjusted = adjustItemsTotalsToTarget(best, patchedItems, (compatible as any).importeTotal);
       analysis = {
         ...(compatible as AnalisisTicketIA),
-        items: patchedItems.length >= 5 ? patchedItems : (compatible as any).items,
+        items: adjusted,
       };
     }
+  }
+
+  // G) Ajuste final si los items no cuadran con el total detectado
+  if ((analysis as any)?.items?.length) {
+    const adjustedItems = addOcrAdjustmentItem(
+      (analysis as any).items as LineaItem[],
+      (analysis as any).importeTotal
+    );
+    analysis = { ...analysis, items: adjustedItems };
   }
 
   return { parsed: analysis, raw_lines };

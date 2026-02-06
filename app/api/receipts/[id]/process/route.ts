@@ -8,6 +8,16 @@ import { parsearItemsDesdeLineas } from "@/lib/ia/analizarTicket";
 
 export const runtime = "nodejs";
 
+function getAccessToken(req: Request): string | null {
+  const headerToken = req.headers.get("x-receipt-token");
+  if (headerToken) return headerToken;
+  const auth = req.headers.get("authorization");
+  if (auth && auth.toLowerCase().startsWith("bearer ")) {
+    return auth.slice(7);
+  }
+  return null;
+}
+
 function toCents(n: any): number {
   const x = Number(n);
   if (!Number.isFinite(x)) return 0;
@@ -40,6 +50,30 @@ function calcItemsSubtotalCents(items: any[]): number {
   return items.reduce((acc: number, it: any) => acc + toCents(it.total), 0);
 }
 
+function pickComputedTotalCents(
+  itemsSubtotalCents: number,
+  igvCents: number,
+  recargoCents: number,
+  totalDetectedCents: number
+): number {
+  const options = [
+    itemsSubtotalCents,
+    itemsSubtotalCents + recargoCents,
+    itemsSubtotalCents + igvCents,
+    itemsSubtotalCents + igvCents + recargoCents,
+  ];
+  let best = options[0];
+  let bestDiff = Math.abs(totalDetectedCents - best);
+  for (const opt of options.slice(1)) {
+    const diff = Math.abs(totalDetectedCents - opt);
+    if (diff < bestDiff) {
+      best = opt;
+      bestDiff = diff;
+    }
+  }
+  return best;
+}
+
 export async function POST(req: Request) {
   // ✅ Evita params Promise (Next)
   const url = new URL(req.url);
@@ -47,6 +81,11 @@ export async function POST(req: Request) {
   const id = parts[parts.indexOf("receipts") + 1];
 
   if (!id) return NextResponse.json({ error: "id requerido" }, { status: 400 });
+
+  const token = getAccessToken(req);
+  if (!token) {
+    return NextResponse.json({ error: "token requerido" }, { status: 401 });
+  }
 
   const sb = supabaseAdmin();
   const bucket = process.env.SUPABASE_STORAGE_BUCKET || "receipts";
@@ -61,11 +100,15 @@ export async function POST(req: Request) {
   // 1) Cargar receipt
   const { data: receipt, error: rErr } = await sb
     .from("receipts")
-    .select("*")
+    .select("id,access_token,attempts,status,image_path")
     .eq("id", id)
     .single();
 
   if (rErr || !receipt) {
+    return NextResponse.json({ error: "no encontrado" }, { status: 404 });
+  }
+
+  if (receipt.access_token !== token) {
     return NextResponse.json({ error: "no encontrado" }, { status: 404 });
   }
 
@@ -131,7 +174,12 @@ export async function POST(req: Request) {
 
     // tu computed actual: items + recargoServicio (ojo: IGV ya viene incluido en precios normalmente,
     // pero tú estás cuadrando contra IMPORTE TOTAL, así que está bien si items ya son con IGV)
-    let computedTotalCents = itemsSubtotalCents + recargoServicioCents;
+    let computedTotalCents = pickComputedTotalCents(
+      itemsSubtotalCents,
+      igvCents,
+      recargoServicioCents,
+      totalDetectedCents
+    );
     let differenceCents = totalDetectedCents - computedTotalCents;
 
     let hasMismatch = Math.abs(differenceCents) > 100;
@@ -161,7 +209,12 @@ export async function POST(req: Request) {
         // recalcula mismatch con nuevos items
         items = (parsed as any).items ?? [];
         itemsSubtotalCents = calcItemsSubtotalCents(items);
-        computedTotalCents = itemsSubtotalCents + recargoServicioCents;
+        computedTotalCents = pickComputedTotalCents(
+          itemsSubtotalCents,
+          igvCents,
+          recargoServicioCents,
+          totalDetectedCents
+        );
         differenceCents = totalDetectedCents - computedTotalCents;
         hasMismatch = Math.abs(differenceCents) > 100;
       }

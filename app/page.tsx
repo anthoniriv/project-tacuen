@@ -8,6 +8,7 @@ import { useTacuenStore } from "@/src/features/tacuen/state/useTacuenStore";
 import { mapOcrToReceiptModel, createMockReceiptModel } from "@/src/features/tacuen/model/adapter";
 import { StepHeader } from "@/src/features/tacuen/ui/components/StepHeader";
 import type { AnalisisTicketIA } from "@/lib/excel/generarExcel";
+import { trackEvent } from "@/src/features/tacuen/analytics/client";
 
 type Status = "idle" | "loading" | "error";
 
@@ -26,13 +27,13 @@ async function createReceipt(file: File) {
   const res = await fetch("/api/receipts", { method: "POST", body: fd });
   const json = await res.json();
   if (!res.ok) throw new Error(json.error || "Error creando receipt");
-  return json as { id: string };
+  return json as { id: string; access_token: string; status?: string; dedup?: boolean };
 }
 
-async function processReceipt(id: string, contexto?: string) {
+async function processReceipt(id: string, accessToken: string, contexto?: string) {
   const res = await fetch(`/api/receipts/${id}/process`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "x-receipt-token": accessToken },
     body: JSON.stringify({ contexto: contexto ?? "" }),
   });
   const json = await res.json();
@@ -40,8 +41,10 @@ async function processReceipt(id: string, contexto?: string) {
   return json as { status: string };
 }
 
-async function getReceipt(id: string) {
-  const res = await fetch(`/api/receipts/${id}`);
+async function getReceipt(id: string, accessToken: string) {
+  const res = await fetch(`/api/receipts/${id}`, {
+    headers: { "x-receipt-token": accessToken },
+  });
   const json = await res.json();
   if (!res.ok) throw new Error(json.error || "Error obteniendo receipt");
   return json as {
@@ -83,12 +86,15 @@ export default function HomePage() {
       if (useMock) {
         receiptModel = createMockReceiptModel();
         if (eventName.trim()) receiptModel.name = eventName.trim();
+        void trackEvent("mock_used");
       } else {
         // ✅ Nuevo flujo: upload -> process -> poll -> parsed_json -> model
-        const { id } = await createReceipt(file!);
+        const { id, access_token, dedup } = await createReceipt(file!);
+        void trackEvent("receipt_created", { receipt_id: id, dedup: Boolean(dedup) });
 
         // Dispara procesamiento (no bloquea UI con el resultado final)
-        await processReceipt(id, "");
+        await processReceipt(id, access_token, "");
+        void trackEvent("receipt_processing_started", { receipt_id: id });
 
         // Polling simple
         const start = Date.now();
@@ -98,7 +104,7 @@ export default function HomePage() {
         let lastStatus: ReceiptStatus = "uploaded";
 
         while (true) {
-          const r = await getReceipt(id);
+          const r = await getReceipt(id, access_token);
           lastStatus = r.status;
 
           if (r.status === "done" || r.status === "needs_review") {
@@ -113,10 +119,12 @@ export default function HomePage() {
             // Opcional: si quieres mostrar aviso en UI cuando hay mismatch:
             // if (r.status === "needs_review") { ... }
 
+            void trackEvent("receipt_processed", { receipt_id: id, status: r.status });
             break;
           }
 
           if (r.status === "error") {
+            void trackEvent("receipt_processed", { receipt_id: id, status: "error" });
             throw new Error(r.error_reason || "Error procesando el ticket");
           }
 

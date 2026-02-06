@@ -2,23 +2,35 @@
 
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useTacuenStore } from "@/src/features/tacuen/state/useTacuenStore";
 import { StepHeader } from "@/src/features/tacuen/ui/components/StepHeader";
 import { FixedBottomCTA } from "@/src/features/tacuen/ui/components/FixedBottomCTA";
 import { PersonChips } from "@/src/features/tacuen/ui/components/PersonChips";
 import type { Person } from "@/src/features/tacuen/model/types";
+import { trackEvent } from "@/src/features/tacuen/analytics/client";
 
 export default function PeoplePage() {
   const router = useRouter();
   const { state, actions } = useTacuenStore();
   const [newPersonName, setNewPersonName] = useState("");
+  const [showDecision, setShowDecision] = useState(false);
 
   if (!state.model) {
     router.push("/");
     return null;
   }
+
+  useEffect(() => {
+    if (
+      state.model &&
+      state.model.people.length === 0 &&
+      typeof state.model.skipPeople === "undefined"
+    ) {
+      setShowDecision(true);
+    }
+  }, [state.model]);
 
   const canContinue = state.model.people.length > 0 && state.errors.length === 0;
 
@@ -52,6 +64,23 @@ export default function PeoplePage() {
     router.push("/items");
   };
 
+  const handleChooseAssign = () => {
+    actions.setSkipPeople(false);
+    setShowDecision(false);
+    if (state.model) {
+      void trackEvent("people_assign", { receipt_id: state.model.id });
+    }
+  };
+
+  const handleChooseSkip = () => {
+    actions.setSkipPeople(true);
+    actions.setStep(4);
+    router.push("/summary");
+    if (state.model) {
+      void trackEvent("people_skipped", { receipt_id: state.model.id });
+    }
+  };
+
   return (
     <main className="min-h-screen pb-24 px-4 py-8 max-w-md mx-auto">
       <StepHeader
@@ -60,6 +89,34 @@ export default function PeoplePage() {
         title="Agregar personas"
         onBack={handleBack}
       />
+
+      {showDecision && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
+          <div className="w-full max-w-md rounded-2xl border border-neutral-800 bg-neutral-900 p-6 shadow-2xl">
+            <h2 className="text-lg font-semibold text-neutral-50">
+              ¿Deseas asignar comensales?
+            </h2>
+            <p className="mt-2 text-sm text-neutral-300">
+              Si eliges <strong>no</strong>, irás directo al resumen y podrás exportar el
+              Excel sin repartir por persona.
+            </p>
+            <div className="mt-4 flex flex-col gap-2">
+              <button
+                onClick={handleChooseAssign}
+                className="w-full rounded-md bg-emerald-500 px-4 py-2 text-sm font-medium text-neutral-950 hover:bg-emerald-400 active:bg-emerald-600 transition"
+              >
+                Sí, asignar personas
+              </button>
+              <button
+                onClick={handleChooseSkip}
+                className="w-full rounded-md border border-neutral-700 bg-neutral-800 px-4 py-2 text-sm font-medium text-neutral-200 hover:bg-neutral-700 active:bg-neutral-900 transition"
+              >
+                No, ir al resumen
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Errores */}
       {state.errors.length > 0 && (

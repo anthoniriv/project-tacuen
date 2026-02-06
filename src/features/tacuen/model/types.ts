@@ -54,6 +54,7 @@ export type ReceiptModel = {
   name: string; // nombre del evento (ej: "Cena en X restaurante")
   countryCode: CountryCode; // Perfil de país
   currency: string; // "PEN", "USD", etc.
+  skipPeople?: boolean; // true si el usuario decide omitir personas/asignaciones
   items: ReceiptItem[];
   fees: FeeModel[];
   people: Person[];

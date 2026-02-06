@@ -24,6 +24,11 @@ export default function SplitPage() {
     return null;
   }
 
+  if (state.model.skipPeople) {
+    router.push("/summary");
+    return null;
+  }
+
   const items = state.model.items.filter((i) => !i.isFree);
   const selectedItem = items.find((i) => i.id === selectedItemId);
   const selectedAllocation =

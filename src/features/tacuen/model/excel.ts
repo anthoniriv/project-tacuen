@@ -3,6 +3,7 @@
 import ExcelJS from "exceljs";
 import type { ReceiptModel, CalculationSummary, AllocationMode } from "./types";
 import { fromCents } from "./money";
+import { computeReceiptTotals } from "./calculator";
 
 /**
  * Genera un Excel con 3 hojas según la especificación:
@@ -171,6 +172,64 @@ export async function generateReceiptExcel(
 
   const buffer = await workbook.xlsx.writeBuffer();
   return buffer;
+}
+
+/**
+ * Genera un Excel simple (sin personas): Items + Summary global
+ */
+export async function generateReceiptExcelSimple(model: ReceiptModel): Promise<ArrayBuffer> {
+  const workbook = new ExcelJS.Workbook();
+
+  // Sheet1: Items
+  const itemsSheet = workbook.addWorksheet("Items");
+  itemsSheet.columns = [
+    { header: "Nombre", key: "name", width: 40 },
+    { header: "Cantidad", key: "qty", width: 12 },
+    { header: "Precio Unitario", key: "unitPrice", width: 16 },
+    { header: "Total", key: "total", width: 14 },
+  ];
+
+  itemsSheet.getRow(1).font = { bold: true };
+  itemsSheet.getRow(1).alignment = { horizontal: "center" };
+
+  for (const item of model.items) {
+    itemsSheet.addRow({
+      name: item.name,
+      qty: item.qty,
+      unitPrice: fromCents(item.unitPriceCents),
+      total: fromCents(item.totalCents),
+    });
+  }
+
+  // Sheet2: Summary
+  const summarySheet = workbook.addWorksheet("Summary");
+  summarySheet.addRow(["Nombre del evento", model.name]);
+  summarySheet.addRow(["Moneda", model.currency]);
+  summarySheet.addRow(["Fecha", new Date(model.createdAt).toLocaleString("es-PE")]);
+  summarySheet.addRow([]);
+
+  const totals = computeReceiptTotals(model, model.countryCode);
+
+  summarySheet.addRow(["TOTALES", ""]);
+  summarySheet.addRow(["Subtotal (Items)", fromCents(totals.itemsSubtotalCents)]);
+
+  const enabledFees = model.fees.filter((f) => f.enabled);
+  for (const fee of enabledFees) {
+    summarySheet.addRow([
+      `${fee.label}${fee.includedInItems ? " (incluido)" : ""}`,
+      fromCents(fee.amountCents),
+    ]);
+  }
+
+  summarySheet.addRow(["Total Calculado", fromCents(totals.computedGrandTotalCents)]);
+  summarySheet.addRow(["Total Original", fromCents(model.totalDetectedCents)]);
+  summarySheet.addRow(["Diferencia", fromCents(totals.differenceCents)]);
+
+  summarySheet.getColumn(1).width = 30;
+  summarySheet.getColumn(2).width = 20;
+  summarySheet.getColumn(2).numFmt = "#,##0.00";
+
+  return workbook.xlsx.writeBuffer();
 }
 
 function formatAllocationMode(mode: AllocationMode): string {
