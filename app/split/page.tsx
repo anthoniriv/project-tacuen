@@ -124,7 +124,7 @@ export default function SplitPage() {
                       {item.name}
                     </div>
                     <div className="text-xs text-neutral-400 mt-1">
-                      {item.qty} x {formatCents(item.unitPriceCents, state.model.currency)} = {formatCents(item.totalCents, state.model.currency)}
+                      {item.qty} x {formatCents(item.unitPriceCents, state.model!.currency)} = {formatCents(item.totalCents, state.model!.currency)}
                     </div>
                   </div>
                   <div className="ml-3">
