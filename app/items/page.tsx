@@ -90,9 +90,13 @@ export default function ItemsPage() {
 
   const handleAddFee = () => {
     const newFee: FeeModel = {
+      id: `fee-service-${Date.now()}`,
+      key: "servicio",
       type: "service",
       label: "Servicio",
-      amount: 0,
+      amountCents: 0,
+      enabled: true,
+      includedInItems: false,
       splitMode: "proportional",
     };
     actions.addFee(newFee);
