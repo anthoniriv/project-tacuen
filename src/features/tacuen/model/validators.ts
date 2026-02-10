@@ -107,6 +107,9 @@ export function validateStep(
 
     case 3:
       // People: validar people.length >= 1
+      if (model.skipPeople) {
+        break;
+      }
       if (model.people.length === 0) {
         errors.push({
           field: "people",
@@ -140,6 +143,9 @@ export function validateStep(
 
     case 4:
       // Split: validar allocations consistentes
+      if (model.skipPeople) {
+        break;
+      }
       if (model.people.length === 0) {
         errors.push({
           field: "people",

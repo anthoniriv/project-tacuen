@@ -10,11 +10,20 @@ import { FixedBottomCTA } from "@/src/features/tacuen/ui/components/FixedBottomC
 import { ItemCard } from "@/src/features/tacuen/ui/components/ItemCard";
 import { FeeEditor } from "@/src/features/tacuen/ui/components/FeeEditor";
 import type { ReceiptItem, FeeModel, FeeType } from "@/src/features/tacuen/model/types";
+import { toCents, fromCents } from "@/src/features/tacuen/model/money";
 
 export default function ItemsPage() {
   const router = useRouter();
   const { state, actions } = useTacuenStore();
   const [editingItem, setEditingItem] = useState<ReceiptItem | null>(null);
+  const [editForm, setEditForm] = useState({
+    name: "",
+    qty: 1,
+    unitPrice: 0,
+    total: 0,
+    category: "plato" as ReceiptItem["category"],
+    isFree: false,
+  });
   const [showAddItem, setShowAddItem] = useState(false);
   const [newItemForm, setNewItemForm] = useState({
     name: "",
@@ -32,7 +41,16 @@ export default function ItemsPage() {
 
   const canContinue = state.model.items.length > 0 && state.errors.length === 0;
 
-  const handleUpdateItem = (itemId: string, updates: Partial<ReceiptItem>) => {
+  const handleUpdateItem = (itemId: string, formData: { unitPrice: number; total: number; qty: number; name: string; category: ReceiptItem["category"]; isFree: boolean }) => {
+    // Convertir valores del formulario a centavos
+    const updates: Partial<ReceiptItem> = {
+      name: formData.name,
+      qty: formData.qty,
+      unitPriceCents: toCents(formData.unitPrice),
+      totalCents: toCents(formData.total),
+      category: formData.category,
+      isFree: formData.isFree,
+    };
     actions.updateItem(itemId, updates);
     setEditingItem(null);
   };
@@ -44,10 +62,15 @@ export default function ItemsPage() {
   };
 
   const handleAddItem = () => {
+    const calculatedTotal = newItemForm.qty * newItemForm.unitPrice || newItemForm.total;
     const newItem: ReceiptItem = {
       id: `item-${Date.now()}`,
-      ...newItemForm,
-      total: newItemForm.qty * newItemForm.unitPrice || newItemForm.total,
+      name: newItemForm.name,
+      qty: newItemForm.qty,
+      unitPriceCents: toCents(newItemForm.unitPrice),
+      totalCents: toCents(calculatedTotal),
+      category: newItemForm.category,
+      isFree: newItemForm.isFree,
     };
     actions.addItem(newItem);
     setNewItemForm({
@@ -224,7 +247,17 @@ export default function ItemsPage() {
             <ItemCard
               key={item.id}
               item={item}
-              onEdit={() => setEditingItem(item)}
+              onEdit={() => {
+                setEditingItem(item);
+                setEditForm({
+                  name: item.name,
+                  qty: item.qty,
+                  unitPrice: fromCents(item.unitPriceCents),
+                  total: fromCents(item.totalCents),
+                  category: item.category,
+                  isFree: item.isFree,
+                });
+              }}
               onDelete={handleDeleteItem}
             />
           ))
@@ -238,9 +271,9 @@ export default function ItemsPage() {
             <h3 className="text-lg font-semibold text-neutral-50">Editar ítem</h3>
             <input
               type="text"
-              value={editingItem.name}
+              value={editForm.name}
               onChange={(e) =>
-                setEditingItem({ ...editingItem, name: e.target.value })
+                setEditForm({ ...editForm, name: e.target.value })
               }
               className="w-full px-3 py-2 bg-neutral-800 border border-neutral-700 rounded-md text-sm text-neutral-200 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none"
             />
@@ -250,13 +283,15 @@ export default function ItemsPage() {
                 step="0.1"
                 min="0"
                 placeholder="Cantidad"
-                value={editingItem.qty}
-                onChange={(e) =>
-                  setEditingItem({
-                    ...editingItem,
-                    qty: parseFloat(e.target.value) || 0,
-                  })
-                }
+                value={editForm.qty || ""}
+                onChange={(e) => {
+                  const qty = parseFloat(e.target.value) || 0;
+                  setEditForm({
+                    ...editForm,
+                    qty,
+                    total: qty * editForm.unitPrice,
+                  });
+                }}
                 className="px-3 py-2 bg-neutral-800 border border-neutral-700 rounded-md text-sm text-neutral-200 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none"
                 inputMode="decimal"
               />
@@ -265,13 +300,15 @@ export default function ItemsPage() {
                 step="0.01"
                 min="0"
                 placeholder="Precio unit."
-                value={editingItem.unitPrice}
-                onChange={(e) =>
-                  setEditingItem({
-                    ...editingItem,
-                    unitPrice: parseFloat(e.target.value) || 0,
-                  })
-                }
+                value={editForm.unitPrice || ""}
+                onChange={(e) => {
+                  const unitPrice = parseFloat(e.target.value) || 0;
+                  setEditForm({
+                    ...editForm,
+                    unitPrice,
+                    total: unitPrice * editForm.qty,
+                  });
+                }}
                 className="px-3 py-2 bg-neutral-800 border border-neutral-700 rounded-md text-sm text-neutral-200 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-500 outline-none"
                 inputMode="decimal"
               />
@@ -280,10 +317,10 @@ export default function ItemsPage() {
                 step="0.01"
                 min="0"
                 placeholder="Total"
-                value={editingItem.total}
+                value={editForm.total || ""}
                 onChange={(e) =>
-                  setEditingItem({
-                    ...editingItem,
+                  setEditForm({
+                    ...editForm,
                     total: parseFloat(e.target.value) || 0,
                   })
                 }
@@ -293,10 +330,10 @@ export default function ItemsPage() {
             </div>
             <div className="flex gap-2">
               <select
-                value={editingItem.category}
+                value={editForm.category}
                 onChange={(e) =>
-                  setEditingItem({
-                    ...editingItem,
+                  setEditForm({
+                    ...editForm,
                     category: e.target.value as ReceiptItem["category"],
                   })
                 }
@@ -310,9 +347,9 @@ export default function ItemsPage() {
               <label className="flex items-center gap-2 px-3 py-2 bg-neutral-800 border border-neutral-700 rounded-md text-sm text-neutral-200 cursor-pointer">
                 <input
                   type="checkbox"
-                  checked={editingItem.isFree}
+                  checked={editForm.isFree}
                   onChange={(e) =>
-                    setEditingItem({ ...editingItem, isFree: e.target.checked })
+                    setEditForm({ ...editForm, isFree: e.target.checked })
                   }
                   className="w-4 h-4 rounded border-neutral-700 bg-neutral-800 text-emerald-500 focus:ring-emerald-500"
                 />
@@ -327,7 +364,10 @@ export default function ItemsPage() {
                 Cancelar
               </button>
               <button
-                onClick={() => handleUpdateItem(editingItem.id, editingItem)}
+                onClick={() => {
+                  handleUpdateItem(editingItem.id, editForm);
+                  setEditingItem(null);
+                }}
                 className="flex-1 px-3 py-2 text-sm font-medium rounded-md bg-emerald-500 text-neutral-950 hover:bg-emerald-400 transition"
               >
                 Guardar

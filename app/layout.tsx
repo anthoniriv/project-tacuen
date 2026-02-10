@@ -2,6 +2,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { TacuenProvider } from "@/src/features/tacuen/state/useTacuenStore";
+import { AnalyticsBootstrap } from "@/src/features/tacuen/analytics/Bootstrap";
 
 export const metadata: Metadata = {
   title: "Tacuen - Divisor de cuentas",
@@ -16,7 +17,10 @@ export default function RootLayout({
   return (
     <html lang="es">
       <body className="min-h-screen bg-neutral-950 text-neutral-50 antialiased">
-        <TacuenProvider>{children}</TacuenProvider>
+        <TacuenProvider>
+          <AnalyticsBootstrap />
+          {children}
+        </TacuenProvider>
       </body>
     </html>
   );

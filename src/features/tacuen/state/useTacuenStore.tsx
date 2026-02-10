@@ -26,6 +26,7 @@ type TacuenState = {
 
 type TacuenAction =
   | { type: "SET_MODEL"; payload: ReceiptModel }
+  | { type: "SET_SKIP_PEOPLE"; payload: boolean }
   | { type: "UPDATE_ITEM"; payload: { itemId: string; updates: Partial<ReceiptItem> } }
   | { type: "ADD_ITEM"; payload: ReceiptItem }
   | { type: "REMOVE_ITEM"; payload: string }
@@ -74,9 +75,9 @@ function updateModelWithValidation(
   const step = (currentStep || 2) as WizardStep;
   const errors = step > 0 ? validateStep(step, updatedModel) : [];
 
-  // Solo calcular summary si hay personas
+  // Solo calcular summary si hay personas y no se omite el paso
   let summary: CalculationSummary | null = null;
-  if (updatedModel.people.length > 0 && isStepReady(step, updatedModel)) {
+  if (!updatedModel.skipPeople && updatedModel.people.length > 0 && isStepReady(step, updatedModel)) {
     summary = computeTotalsByPerson(updatedModel);
   }
 
@@ -87,6 +88,18 @@ function tacuenReducer(state: TacuenState, action: TacuenAction): TacuenState {
   switch (action.type) {
     case "SET_MODEL": {
       const { model: updatedModel, errors, summary } = updateModelWithValidation(action.payload, state.currentStep);
+      return {
+        ...state,
+        model: updatedModel,
+        errors,
+        summary,
+      };
+    }
+
+    case "SET_SKIP_PEOPLE": {
+      if (!state.model) return state;
+      const model: ReceiptModel = { ...state.model, skipPeople: action.payload };
+      const { model: updatedModel, errors, summary } = updateModelWithValidation(model, state.currentStep);
       return {
         ...state,
         model: updatedModel,
@@ -115,7 +128,7 @@ function tacuenReducer(state: TacuenState, action: TacuenAction): TacuenState {
       const errors = validateStep(step, updatedModel);
       
       let summary: CalculationSummary | null = null;
-      if (updatedModel.people.length > 0 && isStepReady(step, updatedModel)) {
+      if (!updatedModel.skipPeople && updatedModel.people.length > 0 && isStepReady(step, updatedModel)) {
         summary = computeTotalsByPerson(updatedModel);
       }
       
@@ -334,7 +347,7 @@ function tacuenReducer(state: TacuenState, action: TacuenAction): TacuenState {
       if (!state.model) return state;
       const step = (state.currentStep || 2) as WizardStep;
       // Solo calcular si hay personas
-      if (state.model.people.length > 0 && isStepReady(step, state.model)) {
+      if (!state.model.skipPeople && state.model.people.length > 0 && isStepReady(step, state.model)) {
         const summary = computeTotalsByPerson(state.model);
         return { ...state, summary };
       }
@@ -381,6 +394,7 @@ const TacuenContext = createContext<
       dispatch: React.Dispatch<TacuenAction>;
       actions: {
         setModel: (model: ReceiptModel) => void;
+        setSkipPeople: (skip: boolean) => void;
         updateItem: (itemId: string, updates: Partial<ReceiptItem>) => void;
         addItem: (item: ReceiptItem) => void;
         removeItem: (itemId: string) => void;
@@ -437,6 +451,9 @@ export function TacuenProvider({ children }: { children: ReactNode }) {
   const actions = {
     setModel: useCallback((model: ReceiptModel) => {
       dispatch({ type: "SET_MODEL", payload: model });
+    }, []),
+    setSkipPeople: useCallback((skip: boolean) => {
+      dispatch({ type: "SET_SKIP_PEOPLE", payload: skip });
     }, []),
     updateItem: useCallback((itemId: string, updates: Partial<ReceiptItem>) => {
       dispatch({ type: "UPDATE_ITEM", payload: { itemId, updates } });

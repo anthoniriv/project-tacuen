@@ -1,9 +1,21 @@
 // lib/ia/analizarTicket.ts
 import { openai } from "./openaiClient";
-import type {
-  AnalisisTicketIA,
-  LineaItem,
-} from "@/lib/excel/generarExcel";
+import sharp from "sharp";
+import type { AnalisisTicketIA, LineaItem } from "@/lib/excel/generarExcel";
+
+/**
+ * ✅ Mejoras
+ * - OCR A: Imagen -> raw_lines[]
+ * - IA B: raw_lines -> AnalisisTicketIA (Structured Outputs JSON Schema)
+ * - Patch determinístico de items (regex) para tickets tipo Chili's:
+ *   qty al inicio + monto final = TOTAL de línea (unit = total/qty)
+ * - Normalización + cuadre suave
+ * - Retry 1 vez si los totales no cuadran
+ */
+
+// ---------------------------------------------
+// Helpers
+// ---------------------------------------------
 
 /** Convierte un File (Web API) a base64 */
 async function fileToBase64(file: File): Promise<string> {
@@ -12,263 +24,825 @@ async function fileToBase64(file: File): Promise<string> {
   return buffer.toString("base64");
 }
 
-/** Combina ítems duplicados (mismo nombre + categoría + bonificación + precioUnitario) */
+/** Convierte un File a base64 aplicando mejoras de imagen (contrast, grayscale, sharpen) */
+async function fileToBase64Enhanced(file: File, mode: "mild" | "strong" = "mild"): Promise<string> {
+  const arrayBuffer = await file.arrayBuffer();
+  const input = Buffer.from(arrayBuffer);
+
+  let pipeline = sharp(input).rotate().grayscale();
+
+  if (mode === "mild") {
+    pipeline = pipeline
+      .resize({ width: 1600, withoutEnlargement: false })
+      .normalize()
+      .sharpen(1.2)
+      .linear(1.05, -5)
+      .gamma(1.1);
+  } else {
+    pipeline = pipeline
+      .resize({ width: 2000, withoutEnlargement: false })
+      .median(1)
+      .normalize()
+      .sharpen(2)
+      .linear(1.25, -12)
+      .gamma(1.2);
+  }
+
+  const enhanced = await pipeline.toBuffer();
+
+  return enhanced.toString("base64");
+}
+
+function round2(n: number): number {
+  const x = Number.isFinite(n) ? n : 0;
+  return Math.round((x + Number.EPSILON) * 100) / 100;
+}
+
+function clampNonNegative(n: number): number {
+  return n < 0 ? 0 : n;
+}
+
+function normalizeSpaces(s: string): string {
+  return (s ?? "")
+    .replace(/\s+/g, " ")
+    .replace(/\s*\+\s*/g, " + ")
+    .replace(/\s+\+/g, " +")
+    .replace(/\+\s+/g, "+ ")
+    .trim();
+}
+
+/** Normaliza nombre para keys */
+function keyName(s: string): string {
+  return normalizeSpaces(s).toLowerCase();
+}
+
+/** Key tolerante para precio (redondeo 2) */
+function keyPrice(n: number): string {
+  return round2(n).toFixed(2);
+}
+
+function sumItemsTotal(items: LineaItem[]): number {
+  return round2(items.reduce((acc, it) => acc + (Number(it.total) || 0), 0));
+}
+
+function normalizeItemName(s: string): string {
+  return (s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function findRawMatch(llmItem: LineaItem, rawItems: LineaItem[]): LineaItem | null {
+  const target = normalizeItemName(llmItem.nombre);
+  if (!target) return null;
+  for (const raw of rawItems) {
+    const rawName = normalizeItemName(raw.nombre);
+    if (!rawName) continue;
+    if (rawName.includes(target) || target.includes(rawName)) {
+      return raw;
+    }
+  }
+  return null;
+}
+
+function adjustItemsTotalsToTarget(
+  llmItems: LineaItem[],
+  rawItems: LineaItem[],
+  targetTotal?: number
+): LineaItem[] {
+  if (!Number.isFinite(targetTotal) || (targetTotal ?? 0) <= 0) return llmItems;
+  if (rawItems.length === 0) return llmItems;
+
+  let current = sumItemsTotal(llmItems);
+  let currentDiff = Math.abs((targetTotal as number) - current);
+
+  const candidates: Array<{
+    idx: number;
+    newTotal: number;
+    improvement: number;
+  }> = [];
+
+  llmItems.forEach((item, idx) => {
+    const raw = findRawMatch(item, rawItems);
+    if (!raw) return;
+    const newTotal = Number(raw.total) || 0;
+    if (newTotal <= 0) return;
+    const newSum = current - Number(item.total || 0) + newTotal;
+    const newDiff = Math.abs((targetTotal as number) - newSum);
+    const improvement = currentDiff - newDiff;
+    if (improvement > 0.001) {
+      candidates.push({ idx, newTotal, improvement });
+    }
+  });
+
+  // Greedy: aplicar las mejores mejoras primero
+  candidates.sort((a, b) => b.improvement - a.improvement);
+
+  const adjusted = llmItems.map((it) => ({ ...it }));
+  for (const c of candidates) {
+    const item = adjusted[c.idx];
+    const newSum = current - Number(item.total || 0) + c.newTotal;
+    const newDiff = Math.abs((targetTotal as number) - newSum);
+    if (newDiff < currentDiff) {
+      item.total = c.newTotal;
+      item.precioUnitario = item.cantidad > 0 ? round2(c.newTotal / item.cantidad) : item.precioUnitario;
+      current = newSum;
+      currentDiff = newDiff;
+    }
+  }
+
+  return adjusted;
+}
+
+function pickBestItemsByTotal(
+  itemsFromLines: LineaItem[],
+  itemsFromLLM: LineaItem[],
+  importeTotal?: number
+): LineaItem[] {
+  if (!Number.isFinite(importeTotal) || (importeTotal ?? 0) <= 0) {
+    return itemsFromLines.length >= 5 ? itemsFromLines : itemsFromLLM;
+  }
+  const target = Number(importeTotal);
+  const sumLines = sumItemsTotal(itemsFromLines);
+  const sumLLM = sumItemsTotal(itemsFromLLM);
+  const diffLines = Math.abs(target - sumLines);
+  const diffLLM = Math.abs(target - sumLLM);
+  return diffLines <= diffLLM ? itemsFromLines : itemsFromLLM;
+}
+
+type CandidatePick = {
+  raw_lines: string[];
+  analysis: AnalisisTicketIA;
+  items: LineaItem[];
+  diffToTotal: number;
+  itemCount: number;
+};
+
+function buildCandidate(raw_lines: string[], analysis: AnalisisTicketIA): CandidatePick {
+  const itemsFromLines = parsearItemsDesdeLineas(raw_lines);
+  const llmItems = ((analysis as any).items ?? []) as LineaItem[];
+  let items = llmItems;
+  if (itemsFromLines.length >= 5) {
+    const best = pickBestItemsByTotal(itemsFromLines, llmItems, (analysis as any).importeTotal);
+    items = adjustItemsTotalsToTarget(best, itemsFromLines, (analysis as any).importeTotal);
+  }
+  const total = Number((analysis as any).importeTotal ?? 0);
+  const sum = sumItemsTotal(items);
+  const diffToTotal = Number.isFinite(total) && total > 0 ? Math.abs(total - sum) : 9999;
+  return { raw_lines, analysis, items, diffToTotal, itemCount: items.length };
+}
+
+function pickBestCandidate(candidates: CandidatePick[]): CandidatePick {
+  return candidates.sort((a, b) => {
+    if (a.diffToTotal !== b.diffToTotal) return a.diffToTotal - b.diffToTotal;
+    return b.itemCount - a.itemCount;
+  })[0];
+}
+
+function addOcrAdjustmentItem(
+  items: LineaItem[],
+  importeTotal?: number
+): LineaItem[] {
+  if (!Number.isFinite(importeTotal) || (importeTotal ?? 0) <= 0) return items;
+  const sum = sumItemsTotal(items);
+  const diff = round2((importeTotal as number) - sum);
+  if (Math.abs(diff) < 0.01) return items;
+  // Solo ajustar si es un desvío razonable
+  if (Math.abs(diff) > 50) return items;
+
+  return [
+    ...items,
+    {
+      nombre: "AJUSTE OCR (revisar)",
+      cantidad: 1,
+      total: diff,
+      precioUnitario: diff,
+      categoria: "otro",
+      esBonificacion: false,
+    },
+  ];
+}
+
+type Categoria = "plato" | "bebida" | "postre" | "otro";
+type RecargoTipo = "servicio" | "delivery" | "propina" | "redondeo" | "descuento" | "otro";
+
+type Recargo = {
+  tipo: RecargoTipo;
+  monto: number; // descuento puede ser negativo
+};
+
+// ---------------------------------------------
+// Combinar duplicados (tolerante)
+// ---------------------------------------------
 function combinarItemsDuplicados(items: LineaItem[]): LineaItem[] {
   const map = new Map<string, LineaItem>();
 
   for (const item of items) {
-    const key = `${item.nombre.toLowerCase()}|${item.categoria}|${item.esBonificacion}|${item.precioUnitario}`;
+    const nombreKey = keyName(item.nombre);
+    const precioKey = keyPrice(item.precioUnitario);
+    const key = `${nombreKey}|${item.categoria}|${item.esBonificacion}|${precioKey}`;
 
     const existente = map.get(key);
     if (!existente) {
       map.set(key, { ...item });
     } else {
-      existente.cantidad += item.cantidad;
-      existente.total += item.total;
+      existente.cantidad = round2(existente.cantidad + item.cantidad);
+      existente.total = round2(existente.total + item.total);
     }
   }
 
   return Array.from(map.values());
 }
 
-/** Normaliza la salida de la IA para forzar coherencia y manejar bonificaciones */
-function normalizarAnalisis(analisis: AnalisisTicketIA): AnalisisTicketIA {
-  const itemsNormalizados: LineaItem[] = analisis.items.map((item) => {
-    let { cantidad, precioUnitario, total, esBonificacion } = item;
+// ---------------------------------------------
+// Normalización items
+// ---------------------------------------------
+function normalizarItems(items: LineaItem[]): LineaItem[] {
+  const out: LineaItem[] = items.map((raw) => {
+    const nombre = normalizeSpaces(raw.nombre || "");
+    const categoria = (raw.categoria || "otro") as Categoria;
 
-    // 1) Si es bonificación: total siempre 0
+    let cantidad = Number(raw.cantidad);
+    let precioUnitario = Number(raw.precioUnitario);
+    let total = Number(raw.total);
+    let esBonificacion = Boolean(raw.esBonificacion);
+
+    if (!Number.isFinite(cantidad)) cantidad = 1;
+    if (!Number.isFinite(precioUnitario)) precioUnitario = 0;
+    if (!Number.isFinite(total)) total = 0;
+
+    // bonificación SOLO si unit y total son 0 (no infieras con uno solo)
+    if (precioUnitario === 0 && total === 0) {
+      esBonificacion = true;
+    }
+
     if (esBonificacion) {
       return {
-        ...item,
+        ...raw,
+        nombre,
+        categoria,
+        cantidad: clampNonNegative(round2(cantidad)),
+        precioUnitario: round2(precioUnitario),
         total: 0,
+        esBonificacion: true,
       };
     }
 
-    // 2) Forzar total ≈ cantidad * precioUnitario cuando sea posible
-    if (precioUnitario > 0 && cantidad > 0) {
-      const calculado = precioUnitario * cantidad;
+    cantidad = clampNonNegative(cantidad);
+    precioUnitario = round2(precioUnitario);
+    total = round2(total);
 
-      if (Math.abs(calculado - total) > 0.01) {
-        const posibleCantidad = total / precioUnitario;
+    const calculado = round2(precioUnitario * cantidad);
+    const diff = Math.abs(calculado - total);
 
-        if (Number.isInteger(posibleCantidad)) {
-          cantidad = posibleCantidad;
-        } else {
-          total = calculado;
-        }
+    if (total === 0 && calculado > 0) {
+      total = calculado;
+    } else if (diff > 0.05 && precioUnitario > 0 && cantidad > 0) {
+      const posible = total / precioUnitario;
+      const posibleRounded = Math.round(posible * 2) / 2; // soporta 0.5
+      if (Math.abs(posible - posibleRounded) <= 0.01) {
+        cantidad = posibleRounded;
       }
     }
 
     return {
-      ...item,
-      cantidad,
-      total,
+      ...raw,
+      nombre,
+      categoria,
+      cantidad: round2(cantidad),
       precioUnitario,
+      total: round2(total),
+      esBonificacion: false,
     };
   });
 
-  const combinados = combinarItemsDuplicados(itemsNormalizados);
-
-  return {
-    ...analisis,
-    items: combinados,
-    personas: analisis.personas ?? [],
-  };
+  return combinarItemsDuplicados(out);
 }
 
-export async function analizarTicketConIA(
+function normalizarRecargos(recargos?: Recargo[]): Recargo[] {
+  if (!Array.isArray(recargos)) return [];
+  return recargos
+    .map((r) => ({
+      tipo: (r?.tipo ?? "otro") as RecargoTipo,
+      monto: round2(Number(r?.monto ?? 0)),
+    }))
+    .filter((r) => Number.isFinite(r.monto) && r.monto !== 0);
+}
+
+function normalizarAnalisisMejorado(analisis: any): AnalisisTicketIA & { recargos?: Recargo[] } {
+  const moneda = "PEN";
+
+  const subtotal = round2(Number(analisis?.subtotal ?? 0));
+  const igv = round2(Number(analisis?.igv ?? 0));
+  const importeTotal = round2(Number(analisis?.importeTotal ?? 0));
+
+  const recargos = normalizarRecargos(analisis?.recargos);
+  const recargoServicioIA = round2(Number(analisis?.recargoServicio ?? 0));
+
+  const recargoServicioDerivado = round2(
+    recargos.filter((r) => r.tipo === "servicio" && r.monto > 0).reduce((a, r) => a + r.monto, 0)
+  );
+
+  const recargoServicio = recargoServicioDerivado !== 0 ? recargoServicioDerivado : recargoServicioIA;
+
+  const items = normalizarItems(Array.isArray(analisis?.items) ? analisis.items : []);
+
+  const recargosPositivos = round2(recargos.filter((r) => r.monto > 0).reduce((a, r) => a + r.monto, 0));
+  const descuentos = round2(
+    recargos.filter((r) => r.tipo === "descuento" && r.monto < 0).reduce((a, r) => a + Math.abs(r.monto), 0)
+  );
+
+  const totalEsperado = round2(subtotal + igv + recargosPositivos - descuentos);
+
+  const delta = round2(importeTotal - totalEsperado);
+  const tolerancia = 0.2;
+
+  let importeTotalFinal = importeTotal;
+  if (importeTotalFinal === 0 && totalEsperado > 0) {
+    importeTotalFinal = totalEsperado;
+  } else if (Math.abs(delta) <= tolerancia && totalEsperado > 0) {
+    importeTotalFinal = totalEsperado;
+  }
+
+  const personas = Array.isArray(analisis?.personas) ? analisis.personas : [];
+
+  return {
+    moneda,
+    subtotal,
+    igv,
+    recargoServicio: round2(recargoServicio),
+    importeTotal: round2(importeTotalFinal),
+    items,
+    personas,
+    recargos,
+  } as any;
+}
+
+// ---------------------------------------------
+// Prompt + Schema (Structured Outputs)
+// ---------------------------------------------
+
+const PROMPT_SISTEMA = `
+Eres un asistente experto en analizar tickets y boletas de consumo de restaurantes en Perú.
+
+Devuelve un JSON EXACTO del schema.
+
+Reglas:
+- Moneda: PEN
+- Usa SOLO lo que esté en la imagen/lines.
+- Items: nombre literal, no resumir.
+- Si hay "RECARGO CONSUMO", colócalo como recargoServicio y además en recargos[] tipo "servicio".
+- personas: SOLO si el contexto trae nombres (sino []).
+
+IMPORTANTE (tickets tipo Chili's):
+En muchas boletas, la línea de item es:
+"CANTIDAD NOMBRE TOTAL"
+donde el monto final es TOTAL de línea (no unitario).
+`;
+
+const ANALISIS_TICKET_SCHEMA = {
+  name: "analisis_ticket",
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["moneda", "subtotal", "igv", "importeTotal", "items", "personas", "recargos"],
+    properties: {
+      moneda: { type: "string", enum: ["PEN"] },
+      subtotal: { type: "number" },
+      igv: { type: "number" },
+      recargoServicio: { type: "number" },
+      importeTotal: { type: "number" },
+      recargos: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["tipo", "monto"],
+          properties: {
+            tipo: { type: "string", enum: ["servicio", "delivery", "propina", "redondeo", "descuento", "otro"] },
+            monto: { type: "number" },
+          },
+        },
+      },
+      items: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["nombre", "cantidad", "precioUnitario", "total", "categoria", "esBonificacion"],
+          properties: {
+            nombre: { type: "string" },
+            cantidad: { type: "number" },
+            precioUnitario: { type: "number" },
+            total: { type: "number" },
+            categoria: { type: "string", enum: ["plato", "bebida", "postre", "otro"] },
+            esBonificacion: { type: "boolean" },
+          },
+        },
+      },
+      personas: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["nombre", "consumo"],
+          properties: {
+            nombre: { type: "string" },
+            consumo: {
+              type: "array",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["item", "cantidad"],
+                properties: {
+                  item: { type: "string" },
+                  cantidad: { type: "number" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+} as const;
+
+// ---------------------------------------------
+// Paso A: Imagen -> raw_lines[]
+// ---------------------------------------------
+
+const TRANSCRIBIR_PROMPT = `
+Eres un OCR especializado en tickets de restaurante en Perú.
+Devuelve SOLO un JSON: { "lines": string[] }
+
+Reglas:
+- Todas las líneas visibles, mismo orden.
+- No corrijas ortografía.
+- No inventes.
+- No resumas.
+`;
+
+const TRANSCRIBIR_SCHEMA = {
+  name: "ticket_lines",
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["lines"],
+    properties: {
+      lines: { type: "array", items: { type: "string" } },
+    },
+  },
+} as const;
+
+export async function transcribirTicketALineas(
   file: File,
-  contexto?: string
-): Promise<AnalisisTicketIA> {
-  const base64 = await fileToBase64(file);
+  opts?: { enhanced?: "mild" | "strong" }
+): Promise<string[]> {
+  const base64 = opts?.enhanced ? await fileToBase64Enhanced(file, opts.enhanced) : await fileToBase64(file);
   const mimeType = file.type || "image/jpeg";
   const dataUrl = `data:${mimeType};base64,${base64}`;
 
-const promptSistema = `
-Eres un asistente experto en analizar tickets y boletas de consumo de restaurantes en Perú.
-
-Tu tarea tiene DOS objetivos principales:
-
-────────────────────────────────────────
-─── 1) ANALIZAR EL TICKET DE LA IMAGEN ─
-────────────────────────────────────────
-
-Debes identificar:
-- Moneda
-- Subtotal (op. gravada)
-- IGV
-- Recargos o cargos adicionales (si existen)
-- Importe total
-- Lista COMPLETA de productos
-
-Cada producto debe incluir:
-- nombre: string
-- cantidad: number
-- precioUnitario: number
-- total: number
-- categoria: "plato" | "bebida" | "postre" | "otro"
-- esBonificacion: boolean
-
-REGLAS IMPORTANTES PARA LOS PRODUCTOS:
-
-1. **NO RESUMAS NI ACORTES LOS NOMBRES**
-   Los nombres deben incluir TODAS las palabras asociadas al producto.
-   Si en la boleta un producto aparece en varias líneas, debes unirlas.
-
-   Ejemplo:
-     FILETE DE POLLO (PEC)
-     + PAPAS FRITAS REGULAR
-     + ENSALADA COCIDA REGULAR
-
-   Debe quedar así:
-     "FILETE DE POLLO (PEC) + PAPAS FRITAS REGULAR + ENSALADA COCIDA REGULAR"
-
-2. **CONCATENA TODAS LAS LÍNEAS DE UN MISMO PRODUCTO**
-   Si un ítem aparece en varias líneas consecutivas, únelas en un único nombre usando " + ".
-
-3. **COPIA LOS NOMBRES LITERALMENTE**
-   No cambies palabras, no reordenes, no simplifiques. Mantén el orden y texto original.
-
-4. **BONIFICACIONES**
-   Si aparece “bonificación”, “desc”, “0.00”, o precio unitario cero, marca:
-   - esBonificacion = true
-   - total = 0
-   (Aunque la boleta muestre un precio de referencia.)
-
-5. **CATEGORÍAS**
-   Usa sentido común:
-   - platos → platos fuertes, pollos, carnes, menús, entradas
-   - bebidas → gaseosas, jarra, jugos, cervezas, agua, etc.
-   - postres → helados, tortas, dulces
-   - otro → conceptos no comestibles, servicios, cargos, empaques
-
-6. **COHERENCIA**
-   total ≈ cantidad × precioUnitario
-   Si la boleta es confusa, respeta SIEMPRE la columna de total.
-
-
-──────────────────────────────────────────────
-─── 2) DISTRIBUCIÓN POR PERSONA (CON CONTEXTO) ─
-──────────────────────────────────────────────
-
-- SOLO generar "personas" si el usuario da nombres o contexto.
-- Si NO hay contexto → "personas": [].
-
-REGLAS IMPORTANTES:
-
-1. **NO USAR NOMBRES DEL TICKET**
-   No uses cliente, cajero, colaborador ni nombres administrativos como consumidores.
-
-2. **CONSUMO POR PERSONA**
-   El usuario puede indicar quién pidió qué, cantidades, o particiones.
-   Debes asignar consumos exactos según ese contexto.
-
-3. **CANTIDADES EXACTAS**
-   - Soporta cantidades decimales (ej. 0.5 para “mitad y mitad”).
-   - No inventes consumos para ítems no mencionados por el usuario.
-
-4. **NO INVENTES ITEMS**
-   Todo item en personas[].consumo debe existir exactamente en items[].nombre.
-
-5. **COINCIDENCIA EXACTA**
-   El valor de "item" dentro de cada consumo debe ser EXACTAMENTE igual (misma cadena)
-   a items[i].nombre (sin resumir, sin corregir, sin cambiar nada).
-
-
-───────────────────────────
-─── FORMATO DE RESPUESTA ──
-───────────────────────────
-
-Devuelve SIEMPRE un JSON válido con esta estructura EXACTA:
-
-{
-  "moneda": "PEN",
-  "subtotal": number,
-  "igv": number,
-  "recargoServicio": number,
-  "importeTotal": number,
-
-  "items": [
-    {
-      "nombre": string,
-      "cantidad": number,
-      "precioUnitario": number,
-      "total": number,
-      "categoria": "plato" | "bebida" | "postre" | "otro",
-      "esBonificacion": boolean
-    }
-  ],
-
-  "personas": [
-    {
-      "nombre": string,
-      "consumo": [
-        {
-          "item": string,
-          "cantidad": number
-        }
-      ]
-    }
-  ]
-}
-
-No incluyas explicaciones, comentarios, texto adicional, markdown ni nada fuera del JSON.
-`;
-
-  const promptUsuario = `
-Analiza el ticket de restaurante de la imagen y devuelve SOLO el JSON descrito.
-
-Contexto adicional proporcionado por el usuario (descripción de quién pidió qué):
-${contexto && contexto.trim().length > 0 ? contexto : "(sin contexto específico)"}
-`;
-
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
+  const res = await openai.chat.completions.create({
+    model: "gpt-4o",
     messages: [
-      { role: "system", content: promptSistema },
+      { role: "system", content: TRANSCRIBIR_PROMPT },
       {
         role: "user",
         content: [
-          { type: "text", text: promptUsuario },
-          {
-            type: "image_url",
-            image_url: { url: dataUrl },
-          },
+          { type: "text", text: "Transcribe el ticket." },
+          { type: "image_url", image_url: { url: dataUrl } },
         ] as any,
       },
     ],
     temperature: 0,
+    response_format: {
+      type: "json_schema",
+      json_schema: TRANSCRIBIR_SCHEMA as any,
+    } as any,
   });
 
-  const content = response.choices[0]?.message?.content;
+  const text = res.choices[0]?.message?.content;
+  if (!text) throw new Error("No se pudo transcribir el ticket");
 
-  if (!content) {
-    throw new Error("La IA no devolvió contenido");
+  const parsed = JSON.parse(text);
+  const lines = Array.isArray(parsed?.lines) ? parsed.lines : [];
+  return lines.map((l: any) => String(l).trim()).filter(Boolean);
+}
+
+// ---------------------------------------------
+// Parser determinístico de items desde raw_lines
+// (soluciona el caso Chili's)
+// ---------------------------------------------
+
+const ITEM_LINE_REGEX = /^\s*(\d+(?:\.\d+)?)\s+(.+?)\s+(\d+\.\d{2})\s*$/;
+
+const IGNORE_REGEX =
+  /(OP\.?\s*GRAVADA|I\.?G\.?V\.?|RECARGO|ICBPER|IMPORTE\s+TOTAL|VISA|VUELTO|RUC|BOLETA|TICKET|MESA|CAJERO|FECHA)/i;
+
+function inferirCategoria(nombre: string): LineaItem["categoria"] {
+  const n = nombre.toLowerCase();
+  if (/(cake|gallet|choco|oreo|molten|dessert|torta|helad)/.test(n)) return "postre";
+  if (/(shake|straw|bliss|tropical|jugo|agua|cola|tea|bebida)/.test(n)) return "bebida";
+  return "plato";
+}
+
+/**
+ * ✅ Qty + Total-final => total de línea.
+ * unit = total/qty
+ */
+export function parsearItemsDesdeLineas(rawLines: string[]): LineaItem[] {
+  const items: LineaItem[] = [];
+
+  for (const line of rawLines) {
+    if (!line) continue;
+    if (IGNORE_REGEX.test(line)) continue;
+
+    const m = line.match(ITEM_LINE_REGEX);
+    if (!m) continue;
+
+    const qty = Number(m[1]);
+    const name = m[2].trim();
+    const lineTotal = Number(m[3]);
+
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+    if (!Number.isFinite(lineTotal) || lineTotal < 0) continue;
+    if (!name) continue;
+
+    const unit = round2(lineTotal / qty);
+
+    items.push({
+      nombre: name,
+      cantidad: qty,
+      total: round2(lineTotal),
+      precioUnitario: unit,
+      categoria: inferirCategoria(name),
+      esBonificacion: false,
+    });
   }
 
-  const text =
-    typeof content === "string"
-      ? content
-      : Array.isArray(content)
-      ? content
-          .map((c: any) => (typeof c === "string" ? c : c.text ?? ""))
-          .join("\n")
-      : String(content);
+  return items;
+}
 
-  const cleaned = text
-    .replace(/```json/gi, "")
-    .replace(/```/g, "")
-    .trim();
+// ---------------------------------------------
+// Paso B IA: raw_lines -> AnalisisTicketIA completo
+// (OJO: NO se llama "parsearLineasATicket" para evitar colisiones)
+// ---------------------------------------------
 
-  let parsed: AnalisisTicketIA;
+function buildParseUserPrompt(raw_lines: string[], contexto?: string) {
+  return `
+raw_lines:
+${raw_lines.map((l) => `- ${l}`).join("\n")}
 
-  try {
-    parsed = JSON.parse(cleaned);
-  } catch (err) {
-    console.error("Error parseando JSON de la IA:", cleaned);
-    throw new Error("La IA no devolvió un JSON válido");
+Contexto:
+${contexto && contexto.trim() ? contexto : "(sin contexto)"}
+`.trim();
+}
+
+export async function parsearLineasATicketConIA(
+  raw_lines: string[],
+  contexto?: string
+): Promise<AnalisisTicketIA> {
+  const res = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: PROMPT_SISTEMA },
+      { role: "user", content: buildParseUserPrompt(raw_lines, contexto) },
+    ],
+    temperature: 0,
+    response_format: {
+      type: "json_schema",
+      json_schema: ANALISIS_TICKET_SCHEMA as any,
+    } as any,
+  });
+
+  const text = res.choices[0]?.message?.content;
+  if (!text) throw new Error("IA no devolvió contenido");
+
+  const parsedRaw = JSON.parse(text);
+  const normalizado = normalizarAnalisisMejorado(parsedRaw);
+  const { recargos: _recargos, ...compatible } = normalizado as any;
+
+  return compatible as AnalisisTicketIA;
+}
+
+// ---------------------------------------------
+// Validación + retry
+// ---------------------------------------------
+
+function validarBasico(result: AnalisisTicketIA) {
+  const total = Number((result as any).importeTotal ?? 0);
+  const subtotal = Number((result as any).subtotal ?? 0);
+  const igv = Number((result as any).igv ?? 0);
+  const recargo = Number((result as any).recargoServicio ?? 0);
+
+  if (total <= 0) return { ok: false, reason: "total_missing" };
+  if (subtotal <= 0) return { ok: false, reason: "subtotal_missing" };
+
+  const expected = round2(subtotal + igv + recargo);
+  const diff = Math.abs(round2(total - expected));
+
+  if (diff > 2.0) return { ok: false, reason: `totals_mismatch_${diff}` };
+
+  return { ok: true, reason: "ok" };
+}
+
+const RETRY_PROMPT = `
+Te voy a dar raw_lines y un JSON preliminar. Tu tarea es SOLO corregir:
+- subtotal
+- igv
+- recargoServicio
+- importeTotal
+y recargos[] si aplica
+
+NO cambies items salvo que estén claramente mal.
+Devuelve SOLO JSON completo válido en el schema.
+`;
+
+// ---------------------------------------------
+// Export principal (imagen -> AnalisisTicketIA)
+// (solo IA directa a imagen)
+// ---------------------------------------------
+
+export async function analizarTicketConIA(file: File, contexto?: string): Promise<AnalisisTicketIA> {
+  const base64 = await fileToBase64(file);
+  const mimeType = file.type || "image/jpeg";
+  const dataUrl = `data:${mimeType};base64,${base64}`;
+
+  const promptUsuario = `
+Analiza el ticket de restaurante de la imagen y devuelve SOLO el JSON del esquema solicitado.
+
+Contexto adicional:
+${contexto && contexto.trim() ? contexto : "(sin contexto)"}
+`.trim();
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: PROMPT_SISTEMA },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: promptUsuario },
+          { type: "image_url", image_url: { url: dataUrl } },
+        ] as any,
+      },
+    ],
+    temperature: 0,
+    response_format: {
+      type: "json_schema",
+      json_schema: ANALISIS_TICKET_SCHEMA as any,
+    } as any,
+  });
+
+  const text = response.choices[0]?.message?.content;
+  if (!text) throw new Error("La IA no devolvió contenido");
+
+  const parsedRaw = JSON.parse(text);
+  const normalizado = normalizarAnalisisMejorado(parsedRaw);
+  const { recargos: _recargos, ...compatible } = normalizado as any;
+
+  return compatible as AnalisisTicketIA;
+}
+
+// ---------------------------------------------
+// Pipeline v2 (recomendado): Imagen -> raw_lines -> IA -> patch items -> retry
+// ---------------------------------------------
+
+export async function analizarTicketConIA_v2(
+  file: File,
+  contexto?: string
+): Promise<{ parsed: AnalisisTicketIA; raw_lines: string[] }> {
+  // A) transcribir (paso normal)
+  const rawNormal = await transcribirTicketALineas(file);
+  const analysisNormal = await parsearLineasATicketConIA(rawNormal, contexto);
+  const candNormal = buildCandidate(rawNormal, analysisNormal);
+
+  // B) Si está débil, probar imagen mejorada (mild)
+  let candidates: CandidatePick[] = [candNormal];
+  if (candNormal.diffToTotal > 5 || candNormal.itemCount < 5) {
+    const rawMild = await transcribirTicketALineas(file, { enhanced: "mild" });
+    if (rawMild.length > 0) {
+      const analysisMild = await parsearLineasATicketConIA(rawMild, contexto);
+      candidates.push(buildCandidate(rawMild, analysisMild));
+    }
   }
 
-  const normalizado = normalizarAnalisis(parsed);
-  return normalizado;
+  // C) Si sigue débil, probar imagen mejorada (strong)
+  const bestSoFar = pickBestCandidate(candidates);
+  if (bestSoFar.diffToTotal > 5 || bestSoFar.itemCount < 5) {
+    const rawStrong = await transcribirTicketALineas(file, { enhanced: "strong" });
+    if (rawStrong.length > 0) {
+      const analysisStrong = await parsearLineasATicketConIA(rawStrong, contexto);
+      candidates.push(buildCandidate(rawStrong, analysisStrong));
+    }
+  }
+
+  const best = pickBestCandidate(candidates);
+  let raw_lines = best.raw_lines;
+  let analysis: AnalisisTicketIA = { ...best.analysis, items: best.items };
+
+  // D) validar
+  let v = validarBasico(analysis);
+
+  // F) retry 1 vez si aún no cuadra
+  if (!v.ok) {
+    const res = await openai.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: RETRY_PROMPT },
+        { role: "user", content: JSON.stringify({ raw_lines, preliminar: analysis }) },
+      ],
+      temperature: 0,
+      response_format: {
+        type: "json_schema",
+        json_schema: ANALISIS_TICKET_SCHEMA as any,
+      } as any,
+    });
+
+    const text = res.choices[0]?.message?.content;
+    if (text) {
+      const retryParsedRaw = JSON.parse(text);
+      const normalizado = normalizarAnalisisMejorado(retryParsedRaw);
+      const { recargos: _recargos, ...compatible } = normalizado as any;
+
+      // reaplicar patch items
+      const patchedItems = parsearItemsDesdeLineas(raw_lines);
+      const llmItems = ((compatible as any).items ?? []) as LineaItem[];
+      const best = patchedItems.length >= 5
+        ? pickBestItemsByTotal(patchedItems, llmItems, (compatible as any).importeTotal)
+        : llmItems;
+      const adjusted = adjustItemsTotalsToTarget(best, patchedItems, (compatible as any).importeTotal);
+      analysis = {
+        ...(compatible as AnalisisTicketIA),
+        items: adjusted,
+      };
+    }
+  }
+
+  // G) Ajuste final si los items no cuadran con el total detectado
+  if ((analysis as any)?.items?.length) {
+    const adjustedItems = addOcrAdjustmentItem(
+      (analysis as any).items as LineaItem[],
+      (analysis as any).importeTotal
+    );
+    analysis = { ...analysis, items: adjustedItems };
+  }
+
+  return { parsed: analysis, raw_lines };
+}
+
+// ---------------------------------------------
+// Extra: Transcribir SOLO tabla de items (si lo quieres usar)
+// ---------------------------------------------
+
+const TABLE_ONLY_PROMPT = `
+Eres un OCR especializado SOLO en la sección de ITEMS (productos) de un ticket de restaurante en Perú.
+
+Devuelve SOLO JSON:
+{ "items_lines": string[] }
+
+Reglas:
+- Incluye únicamente líneas de productos (no OP.GRAVADA, IGV, RECARGO, TOTAL, VISA, VUELTO, etc.)
+- Mantén el orden
+- No inventes
+`;
+
+const TABLE_ONLY_SCHEMA = {
+  name: "items_lines",
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["items_lines"],
+    properties: {
+      items_lines: { type: "array", items: { type: "string" } },
+    },
+  },
+} as const;
+
+export async function transcribirSoloTablaItems(file: File): Promise<string[]> {
+  const base64 = await fileToBase64(file);
+  const mimeType = file.type || "image/jpeg";
+  const dataUrl = `data:${mimeType};base64,${base64}`;
+
+  const res = await openai.chat.completions.create({
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: TABLE_ONLY_PROMPT },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Extrae SOLO la tabla de items." },
+          { type: "image_url", image_url: { url: dataUrl } },
+        ] as any,
+      },
+    ],
+    temperature: 0,
+    response_format: {
+      type: "json_schema",
+      json_schema: TABLE_ONLY_SCHEMA as any,
+    } as any,
+  });
+
+  const text = res.choices[0]?.message?.content;
+  if (!text) return [];
+
+  const parsed = JSON.parse(text);
+  return (parsed.items_lines || []).map((s: any) => String(s).trim()).filter(Boolean);
 }
