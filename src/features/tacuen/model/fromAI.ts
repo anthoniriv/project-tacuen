@@ -61,8 +61,6 @@ export function receiptModelFromAI(ai: any): ReceiptModel {
       label: "Recargo Consumo",
       amountCents: recargo,
       enabled: true,
-      includedInItems: true, // en muchos restaurantes aparece como parte del total, pero NO está en items
-      // si tú lo sumas al computed_total, ponlo en false; si solo informativo, true.
       includedInItems: false,
       splitMode: "proportional",
     });

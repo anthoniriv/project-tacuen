@@ -1,6 +1,6 @@
 // src/features/tacuen/country/profiles.ts
 
-import type { CountryProfile } from "./types";
+import type { CountryCode, CountryProfile } from "./types";
 
 /**
  * Perfil de configuración para PERÚ

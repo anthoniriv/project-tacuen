@@ -84,7 +84,7 @@ export function AllocationEditor({
       newParticipants = [...allocation.participants, personId];
     }
 
-    if (newParticipants.length === 0 && mode !== "all") {
+    if (newParticipants.length === 0) {
       return; // No permitir 0 participantes
     }
 
