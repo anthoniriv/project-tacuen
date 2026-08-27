@@ -3,6 +3,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 import { TacuenProvider } from "@/src/features/tacuen/state/useTacuenStore";
 import { AnalyticsBootstrap } from "@/src/features/tacuen/analytics/Bootstrap";
+import { WebMCPBootstrap } from "@/src/features/tacuen/webmcp/WebMCPBootstrap";
 
 export const metadata: Metadata = {
   title: "Tacuen - Divisor de cuentas",
@@ -19,6 +20,7 @@ export default function RootLayout({
       <body className="min-h-screen bg-neutral-950 text-neutral-50 antialiased">
         <TacuenProvider>
           <AnalyticsBootstrap />
+          <WebMCPBootstrap />
           {children}
         </TacuenProvider>
       </body>
