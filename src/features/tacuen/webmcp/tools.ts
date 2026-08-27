@@ -13,6 +13,7 @@ import type {
 import type { TacuenActions, TacuenState } from "../state/useTacuenStore";
 import { computeTotalsByPerson } from "../model/calculator";
 import { generateReceiptExcel, generateReceiptExcelSimple } from "../model/excel";
+import { createMockReceiptModel } from "../model/adapter";
 import { downloadXlsx } from "./client";
 
 export type StoreHandles = {
@@ -134,6 +135,23 @@ export function buildTools(handles: StoreHandles): ToolDefinition[] {
           const model = state.model as ReceiptModel;
           const summary = state.summary ?? computeTotalsByPerson(model);
           return textResult(JSON.stringify(summary));
+        }),
+    },
+    {
+      name: "load_sample_receipt",
+      description:
+        "Load a sample receipt with demo data (items, people, allocations, fees) so the split can be demonstrated without uploading a photo. Call this first to bootstrap the wizard when no model is loaded yet.",
+      inputSchema: {
+        type: "object",
+        properties: { eventName: { type: "string" } },
+      },
+      execute: (args) =>
+        safeResult(() => {
+          const model = createMockReceiptModel();
+          const name = asString(args.eventName);
+          if (name) model.name = name;
+          h.getActions().setModel(model);
+          return textResult(JSON.stringify({ ok: true, model }));
         }),
     },
     {
