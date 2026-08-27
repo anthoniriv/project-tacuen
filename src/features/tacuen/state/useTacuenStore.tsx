@@ -16,12 +16,35 @@ import { validateStep, isStepReady, type ValidationError, type WizardStep } from
 import { computeTotalsByPerson, computeReceiptTotals } from "../model/calculator";
 import type { CalculationSummary } from "../model/types";
 
-type TacuenState = {
+export type TacuenState = {
   model: ReceiptModel | null;
   summary: CalculationSummary | null;
   errors: ValidationError[]; // Ahora incluye severity
   currentStep: number; // 0 = home, 1 = items, 2 = people, 3 = split, 4 = summary
   history: ReceiptModel[]; // último evento + historial (max 10)
+};
+
+export type TacuenActions = {
+  setModel: (model: ReceiptModel) => void;
+  setSkipPeople: (skip: boolean) => void;
+  updateItem: (itemId: string, updates: Partial<ReceiptItem>) => void;
+  addItem: (item: ReceiptItem) => void;
+  removeItem: (itemId: string) => void;
+  updatePerson: (personId: string, updates: Partial<Person>) => void;
+  addPerson: (person: Person) => void;
+  removePerson: (personId: string) => void;
+  updateAllocation: (itemId: string, allocation: Allocation) => void;
+  updateFee: (index: number, fee: FeeModel) => void;
+  addFee: (fee: FeeModel) => void;
+  removeFee: (index: number) => void;
+  setRounding: (step: number, strategy: RoundingStrategy) => void;
+  setStep: (step: number) => void;
+  validate: () => void;
+  calculate: () => void;
+  loadFromHistory: (model: ReceiptModel) => void;
+  saveToHistory: () => void;
+  reset: () => void;
+  loadFromLocalStorage: () => void;
 };
 
 type TacuenAction =
@@ -392,28 +415,7 @@ const TacuenContext = createContext<
   | {
       state: TacuenState;
       dispatch: React.Dispatch<TacuenAction>;
-      actions: {
-        setModel: (model: ReceiptModel) => void;
-        setSkipPeople: (skip: boolean) => void;
-        updateItem: (itemId: string, updates: Partial<ReceiptItem>) => void;
-        addItem: (item: ReceiptItem) => void;
-        removeItem: (itemId: string) => void;
-        updatePerson: (personId: string, updates: Partial<Person>) => void;
-        addPerson: (person: Person) => void;
-        removePerson: (personId: string) => void;
-        updateAllocation: (itemId: string, allocation: Allocation) => void;
-        updateFee: (index: number, fee: FeeModel) => void;
-        addFee: (fee: FeeModel) => void;
-        removeFee: (index: number) => void;
-        setRounding: (step: number, strategy: RoundingStrategy) => void;
-        setStep: (step: number) => void;
-        validate: () => void;
-        calculate: () => void;
-        loadFromHistory: (model: ReceiptModel) => void;
-        saveToHistory: () => void;
-        reset: () => void;
-        loadFromLocalStorage: () => void;
-      };
+      actions: TacuenActions;
     }
   | undefined
 >(undefined);

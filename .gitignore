@@ -79,6 +79,9 @@ logs/
 *.temp
 .cache/
 
+# SDD / ATL registry
+.atl/
+
 # Package manager locks (opcional - descomenta si no quieres subir los locks)
 # package-lock.json
 # yarn.lock
